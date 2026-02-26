@@ -1,0 +1,23 @@
+{
+  "Environment": "production",
+  "Clusters": [
+    {
+      "ClusterIdentifier": "sample-cluster-identifier",
+      "ClusterWriterEndpoint": "example-cluster-writer-endpoint",
+      "Criticality": "Tier-2",
+      "Databases": [
+        {
+          "Schema": "schema",
+          "IncludeTables": [],
+          "ExcludeTables": [],
+          "FragmentationThresholds": {
+            "ReorganizeMinPercent": 60,
+            "RebuildMinPercent": 30
+          },
+          "MinRowCount": 1000,
+          "MaxConcurrentTasks": 2
+        }
+      ]
+    }
+  ]
+}

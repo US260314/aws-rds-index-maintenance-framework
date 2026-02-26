@@ -1,0 +1,1005 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS RDS Database Index Maintenance'
+
+Parameters:
+  pEnvironment:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: Environment Type
+    Default: environment
+    
+  EmailAddress:
+    Type: String
+    Description: Email address to subscribe to SNS topic for notifications
+    Default: 'GENERIC_dba_dw@example.com'
+    
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for Lambda function in seconds
+    Default: 900
+    
+  RDSIndexMaintenanceDBPassword:
+    Type: String
+    Description: Password to Perform Index maintenance on MySQL RDS Instances
+    
+  RDSIndexMaintenanceLoggingWriterEndpoint:
+    Type: String
+    Description: RDS Index maintenance Logging writer endpoint
+    
+  RDSIndexMaintenanceLoggingDB:
+    Type: String
+    Description: RDS Index maintenance Logging Database Name
+    
+  RDSIndexMaintenanceLoggingDBPassword:
+    Type: String
+    Description: Password to Perform Index maintenance Logging in MySQL RDS Instances
+    
+  SubnetID1:
+    Type: String
+    Description: First SubnetID from RDS subnet group
+    
+  SubnetID2:
+    Type: String
+    Description: Second SubnetID from RDS subnet group
+    
+  SubnetRange1:
+    Type: String
+    Description: First SubnetID IP Address range from RDS subnet group
+    
+  SubnetRange2:
+    Type: String
+    Description: Second SubnetID Ip address range from RDS subnet group
+    
+  VPCID:
+    Type: String
+    Description: VPCID for AWS account
+    
+Conditions:
+  IsPrimary:  !Equals [!Ref AWS::Region, "us-east-1"]
+  IsDR:  !Equals [!Ref AWS::Region, "us-east-2"]
+    
+Resources:
+  RDSIndexMaintenanceMetadataReaderLambdaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader"
+      GroupDescription: "Security group for RDS Index maintenance Metadata Reader Lambda Function"
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange1
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange2
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: X.X.X.X/32
+          
+  RDSIndexMaintenanceWorkerLambdaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub "it-${pEnvironment}-rds-index-maintenance-worker"
+      GroupDescription: "Security group for RDS Index maintenance worker Lambda Function"
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange1
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange2
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: X.X.X.X/32
+          
+  RDSIndexMaintenanceLoggerLambdaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub "it-${pEnvironment}-rds-index-maintenance-logger"
+      GroupDescription: "Security group for RDS Index maintenance logger Lambda Function"
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange1
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref SubnetRange2
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: X.X.X.X/32
+      
+  RDSIndexMaintenanceIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "it-${pEnvironment}-rds-index-maintenance"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+          - Effect: 'Allow'
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action: 'sts:AssumeRole'
+          - Effect: 'Allow'
+            Principal:
+              Service: 'states.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: !Sub "it-${pEnvironment}-rds-index-maintenance"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: 'Allow'
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  - 'rds:ListTagsForResource'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:it-${pEnvironment}-rds-index-maintenance"
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:it-${pEnvironment}-critical-rds-index-maintenance"
+              - Effect: 'Allow'
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:us-east-1:${AWS::AccountId}:secret:it-${pEnvironment}-secrets-mysql-rds-index-maintenance-*"
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub "arn:aws:s3:::it-${pEnvironment}-s3-rds-index-maintenance/*"
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:it-${pEnvironment}-rds-index-maintenance-*"
+              - Effect: 'Allow'
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:it-${pEnvironment}-rds-index-maintenance-sfn"
+      
+  RDSIndexMaintenancemetadataReaderLambdaLayer:
+       Type: AWS::Lambda::LayerVersion
+       Properties:
+         LayerName: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader-lambda-layer"
+         Description: PyMySQL Layer for RDS Index maintenance metadata reader Lambda
+         Content: 
+           S3Bucket: !Sub "it-${pEnvironment}-s3-rds-index-maintenance"
+           S3Key: pymysql_layer.zip
+         CompatibleRuntimes: 
+           - python3.9
+           
+  RDSIndexMaintenanceMetadataReaderLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: IsPrimary
+    Properties:
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt RDSIndexMaintenanceIAMRole.Arn
+      FunctionName: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader"
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import json
+          import pymysql
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def convert_decimal(obj):
+              if isinstance(obj, list):
+                  return [convert_decimal(i) for i in obj]
+              elif isinstance(obj, dict):
+                  return {k: convert_decimal(v) for k, v in obj.items()}
+              elif isinstance(obj, Decimal):
+                  return float(obj)
+              else:
+                  return obj          
+          
+          def get_thresholds_from_s3(bucket, key):
+              s3 = boto3.client('s3')
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  data = response['Body'].read()
+                  return json.loads(data)
+              except Exception as e:
+                  logger.error(f"Error retrieving thresholds from S3: {str(e)}")
+                  raise
+                  
+          def lambda_handler(event, context):
+              logger.info("Lambda execution started")
+              # Read environment variables
+              pEnvironment = os.environ["pEnvironment"]
+              bucket_name = os.environ["S3BucketName"]
+              config_file_key = os.environ["ConfigFileKey"]
+              secret_name = os.environ["SecretName"]
+              sns_critical_topic = os.environ["CriticalSNSTopicArn"]
+              sns_noncritical_topic = os.environ["NonCriticalSNSTopicArn"]
+              
+              # Extract AWS account ID
+              if context and hasattr(context, 'invoked_function_arn'):
+                  aws_account_id = context.invoked_function_arn.split(":")[4]
+              else:
+                  raise ValueError("Unable to retrieve AWS Account ID from Lambda context.")
+                  
+              work_items = []
+              
+              # Initialize AWS clients
+              rds_client = boto3.client('rds')
+              secrets_client = boto3.client('secretsmanager')
+              sns_client = boto3.client('sns')
+              sfn_client = boto3.client('stepfunctions')
+
+              # Load thresholds from S3
+              logger.info(f"Reading config from S3 bucket: {bucket_name}, key: {config_file_key}")
+              config = get_thresholds_from_s3(bucket_name, config_file_key)
+              clusters = config.get("Clusters", [])
+              
+              # Get DB credentials from Secrets Manager
+              try:
+                  secret = secrets_client.get_secret_value(SecretId=secret_name)
+                  secret_dict = json.loads(secret['SecretString'])
+                  username = secret_dict['username']
+                  password = secret_dict['password']
+                  port = int(secret_dict.get('port', 3306))
+              except Exception as e:
+                  logger.error(f"Error retrieving secret '{secret_name}': {str(e)}")
+                  raise
+              
+              for cluster in clusters:
+                  endpoint = cluster.get("ClusterWriterEndpoint")
+                  criticality = cluster.get("Criticality", "Tier-3").upper()
+                  logger.info(f"Processing cluster endpoint: {endpoint}, Criticality: {criticality}")
+                  
+                  if not endpoint:
+                      logger.warning("No writer endpoint found for a cluster in config. Skipping.")
+                      continue
+                  
+                  try:
+                      conn = pymysql.connect(
+                          host=endpoint,
+                          user=username,
+                          password=password,
+                          port=port,
+                          connect_timeout=120
+                      )
+                      logger.info(f"Connected to cluster writer endpoint: {endpoint}")
+                  except Exception as e: 
+                      logger.error(f"Connection failed to {endpoint}: {str(e)}")
+                      topic = sns_critical_topic if criticality == "TIER-1" else sns_noncritical_topic
+                      sns_client.publish(
+                          TopicArn=topic,
+                          Message=f"Failed to connect to {endpoint}: {str(e)}",
+                          Subject=f"RDS Connection Failure - {pEnvironment.upper()}"
+                      )
+                      continue
+                      
+                  for db in cluster.get("Databases", []):
+                      schema = db["Schema"]
+                      min_row_count = db.get("MinRowCount", 1000)
+                      max_row_count = db.get("MaxRowCount",1000)
+                      thresholds = db.get("FragmentationThreshold", {})
+                      frag_threshold = db.get("FragmentationThreshold", 60)
+                      include_tables = db.get("IncludeTables", [])
+                      exclude_tables = db.get("ExcludeTables", [])
+                      
+                      fragmentation_query = f"""
+                      SELECT 
+                          TABLE_SCHEMA,
+                          TABLE_NAME,
+                          ENGINE,
+                          TABLE_ROWS,
+                          ROUND(DATA_LENGTH / 1024 / 1024, 2) AS DATA_MB,
+                          ROUND(INDEX_LENGTH / 1024 / 1024, 2) AS INDEX_MB,
+                          ROUND(DATA_FREE / 1024 / 1024, 2) AS FREE_MB,
+                          ROUND((DATA_FREE / (DATA_LENGTH + INDEX_LENGTH)) * 100, 2) AS FRAGMENTATION_PERCENT
+                      FROM information_schema.tables
+                      WHERE TABLE_TYPE = 'BASE TABLE'
+                        AND ENGINE = 'InnoDB'
+                        AND TABLE_SCHEMA = '{schema}'
+                        AND DATA_FREE > 0
+                        AND (DATA_LENGTH + INDEX_LENGTH) > 0
+                        AND TABLE_ROWS > {min_row_count}
+                        AND TABLE_ROWS < {max_row_count}
+                        AND ROUND((DATA_FREE / (DATA_LENGTH + INDEX_LENGTH)) * 100, 2) > {frag_threshold}
+                      """
+                      
+                      # Add IncludeTables filter if provided
+                      if include_tables:
+                          include_table_list = "', '".join(include_tables)
+                          fragmentation_query += f" AND TABLE_NAME IN ('{include_table_list}')"
+                          
+                      # Add ExcludeTables filter if provided
+                      if exclude_tables:
+                          exclude_table_list = "', '".join(exclude_tables)
+                          fragmentation_query += f" AND TABLE_NAME NOT IN ('{exclude_table_list}')"
+                          
+                      # Finalize ordering
+                      fragmentation_query += " ORDER BY FRAGMENTATION_PERCENT DESC;"
+                      
+                      try:
+                          with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+                              logger.info(f"Executing fragmentation query for schema: {schema}")
+                              cursor.execute(fragmentation_query)
+                              results = cursor.fetchall()
+                              logger.info(f"{len(results)} fragmented tables found in {schema}")
+                              
+                              fk_query = f"""
+                                  SELECT DISTINCT TABLE_NAME as tab FROM information_schema.key_column_usage
+                                  WHERE TABLE_SCHEMA = '{schema}' AND REFERENCED_TABLE_NAME IS NOT NULL
+                                  UNION
+                                  SELECT DISTINCT REFERENCED_TABLE_NAME as tab FROM information_schema.key_column_usage
+                                  WHERE TABLE_SCHEMA = '{schema}' AND REFERENCED_TABLE_NAME IS NOT NULL
+                              """
+                              cursor.execute(fk_query)
+                              fk_tables = {row['tab'] for row in cursor.fetchall()}
+                              logger.info(f"Tables with FK constraints in {schema}: {fk_tables}")
+                              
+                              for row in results:
+                                  logger.info(f"Processing row: {row}")
+                                  row_clean = convert_decimal(row)
+                                  if "TABLE_NAME" not in row_clean:
+                                      logger.error(f"Row is missing TABLE_NAME: {row_clean}")
+                                      continue
+                                  table_name = row_clean["TABLE_NAME"]
+                                  
+                                  # Only run OPTIMIZE if table not in any FK
+                                  if table_name in fk_tables:
+                                      ops = ["ANALYZE"]
+                                      logger.info(f"Table {table_name} is involved in FK, scheduling ANALYZE only.")
+                                  else:
+                                      ops = ["ANALYZE", "OPTIMIZE"]
+                                      logger.info(f"Table {table_name} has no FK involvement, scheduling ANALYZE and OPTIMIZE.")                                   
+                                  
+                                  for operation in ops:
+                                      work_items.append({
+                                          "ClusterWriterEndpoint": endpoint,
+                                          "Schema"              : schema,
+                                          "TableName"           : row_clean["TABLE_NAME"],
+                                          "ReorganizePercent"   : row_clean["FRAGMENTATION_PERCENT"],
+                                          "Criticality"         : criticality,
+                                          "Operation"           : operation
+                                      })
+                                      logger.info(f"Added work_item for {table_name}: Operation {operation}")
+                                      
+                      except Exception as e:
+                          logger.error(f"Query failed on schema {schema}: {str(e)}")
+                          topic = sns_critical_topic if criticality == "TIER-1" else sns_noncritical_topic
+                          sns_client.publish(
+                              TopicArn=topic,
+                              Message=f"Fragmentation query failed for {schema} in {endpoint}: {str(e)}",
+                              Subject=f"RDS Query Failure - {pEnvironment.upper()} - {schema}"
+                          )    
+
+                  conn.close()
+                  if work_items:
+                      try:
+                          logger.info(f"Starting Step Functions execution with {len(work_items)} work_items")
+                          exec_resp = sfn_client.start_execution(
+                              stateMachineArn=os.environ["StateMachineArn"],
+                              input=json.dumps({"tables": work_items})
+                          )
+                          logger.info(f"Started maintenance SFN: {exec_resp['executionArn']}")
+                      except Exception as e:
+                          logger.error(f"Failed to start Step Functions execution: {e}")
+                          # Alert via appropriate SNS topic (critical if any Tier-1 item)
+                          has_tier1 = any(
+                              c.get("Criticality", "Tier-3").upper() == "TIER-1"
+                              for c in clusters
+                          )
+                          alert_topic = sns_critical_topic if has_tier1 else sns_noncritical_topic
+                          sns_client.publish(
+                              TopicArn=alert_topic,
+                              Message=f"Could not start Step Functions execution: {e}",
+                              Subject=f"RDS Index Maintenance Orchestration Failure - {pEnvironment.upper()}"
+                          )
+                  else:
+                       logger.info("No fragmented tables above thresholds – nothing to send to Step Functions.") 
+                       
+              logger.info("Lambda execution completed")             
+
+      Runtime: python3.9
+      VpcConfig:
+        SubnetIds: 
+          - !Ref SubnetID1
+          - !Ref SubnetID2
+        SecurityGroupIds:
+          - !Ref RDSIndexMaintenanceMetadataReaderLambdaSecurityGroup
+      Layers:
+        - !Ref RDSIndexMaintenancemetadataReaderLambdaLayer
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 128
+      Environment:
+        Variables:
+          NonCriticalSNSTopicArn: !Ref RDSIndexMaintenanceSNSTopic
+          CriticalSNSTopicArn: !Ref RDSIndexMaintenanceCriticalSNSTopic
+          pEnvironment: !Ref pEnvironment
+          S3BucketName: !Sub "it-${pEnvironment}-s3-rds-index-maintenance"
+          ConfigFileKey: "RDS_Index_Maintenance_Config.json"
+          SecretName: !Sub "it-${pEnvironment}-secrets-mysql-rds-index-maintenance" 
+          StateMachineArn: !GetAtt RDSIndexMaintenanceStateMachine.Arn          
+          
+  RDSIndexMaintenanceMetadataReaderLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Condition: IsPrimary
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt RDSIndexMaintenanceMetadataReaderLambdaFunction.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/it-${pEnvironment}-rds-index-maintenance-metadata-reader'
+          
+  RDSIndexMaintenanceSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Condition: IsPrimary
+    Properties:
+      TopicName: !Sub "it-${pEnvironment}-rds-index-maintenance"
+      
+  RDSIndexMaintenanceCriticalSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Condition: IsPrimary
+    Properties:
+      TopicName: !Sub "it-${pEnvironment}-critical-rds-index-maintenance"
+      
+  RDSSNSTopicEmailSubscription:
+    Type: "AWS::SNS::Subscription" 
+    Condition: IsPrimary    
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref RDSIndexMaintenanceSNSTopic
+      
+  RDSCriticalSNSTopicEmailSubscription:
+    Type: "AWS::SNS::Subscription" 
+    Condition: IsPrimary    
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref RDSIndexMaintenanceCriticalSNSTopic
+          
+  RDSIndexMaintenanceMetadataReaderEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimary 
+    Properties: 
+      Name: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader"
+      Description: Cloudwatch event rule to trigger RDS Index Maintenance Metadata Reader Lambda function
+      ScheduleExpression: "cron(6 5 ? * 2-7 *)"
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/it-${pEnvironment}-rds-index-maintenance"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt RDSIndexMaintenanceMetadataReaderLambdaFunction.Arn
+          Id: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader"
+          
+  RDSIndexMaintenanceSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Condition: IsPrimary 
+    Properties:
+      Description: RDS Index maintenance
+      SecretString: !Sub '{"username": "aws_rds_index_maintenance", "password" :"${RDSIndexMaintenanceDBPassword}", "engine": "mysql", "port": "3306"}'
+      Name: !Sub 'it-${pEnvironment}-secrets-mysql-rds-index-maintenance'
+      Tags:
+        - Key: application
+          Value: servicing2
+        - Key: environment
+          Value: !Ref pEnvironment
+        - Key: application-id
+          Value: tbd
+        - Key: team
+          Value: servicing2 
+        - Key: cost-center  
+          Value: tbd
+          
+  RDSIndexMaintenanceLoggingSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Condition: IsPrimary 
+    Properties:
+      Description: RDS Index maintenance Logging
+      SecretString: !Sub '{"username": "rds_maintenance_user_dev", "password" :"${RDSIndexMaintenanceLoggingDBPassword}", "engine": "postgresql", "port": "5432", "host": "${RDSIndexMaintenanceLoggingWriterEndpoint}", "dbname": "${RDSIndexMaintenanceLoggingDB}"}'
+      Name: !Sub 'it-${pEnvironment}-secrets-mysql-rds-index-maintenance-logging'
+      Tags:
+        - Key: application
+          Value: servicing2
+        - Key: environment
+          Value: !Ref pEnvironment
+        - Key: application-id
+          Value: tbd
+        - Key: team
+          Value: servicing2 
+        - Key: cost-center  
+          Value: tbd
+          
+  RDSIndexMaintenanceStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Condition: IsPrimary
+    Properties:
+      StateMachineName: !Sub "it-${pEnvironment}-rds-index-maintenance-sfn"
+      RoleArn: !GetAtt RDSIndexMaintenanceIAMRole.Arn
+      DefinitionString: 
+        !Sub |
+          { 
+            "Comment": "Parallel index maintenance (max 2 concurrent tables)",
+            "StartAt": "PerTableMaintenance",
+            "States": {
+              "PerTableMaintenance": {
+                "Type": "Map",
+                "ItemsPath": "$.tables",
+                "MaxConcurrency": 2,
+                "Iterator": {
+                  "StartAt": "RunWorker",
+                  "States": {
+                    "RunWorker": {
+                      "Type": "Task",
+                      "Resource": "${RDSIndexMaintenanceWorkerLambdaFunction.Arn}",
+                      "Next": "LogResults"
+                  },
+                  "LogResults": {
+                    "Type": "Task",
+                    "Resource": "${RDSIndexMaintenanceLoggerLambdaFunction.Arn}",
+                    "End": true
+                  }
+                 }
+               },
+               "End": true
+              }
+            }
+          }
+
+
+
+  RDSIndexMaintenanceWorkerLambdaLayer:
+       Type: AWS::Lambda::LayerVersion
+       Properties:
+         LayerName: !Sub "it-${pEnvironment}-rds-index-maintenance-worker-lambda-layer"
+         Description: PyMySQL Layer for RDS Index maintenance worker Lambda
+         Content: 
+           S3Bucket: !Sub "it-${pEnvironment}-s3-rds-index-maintenance"
+           S3Key: pymysql_layer.zip
+         CompatibleRuntimes: 
+           - python3.9
+
+  RDSIndexMaintenanceWorkerLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: IsPrimary
+    Properties:
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt RDSIndexMaintenanceIAMRole.Arn
+      FunctionName: !Sub "it-${pEnvironment}-rds-index-maintenance-worker"
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import json
+          import pymysql
+          from datetime import datetime
+          from pymysql.cursors import DictCursor
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Expected event (sample):
+              {
+                "ClusterWriterEndpoint": "host",
+                "Schema": "Schema_Name",
+                "TableName": "Table_Name",
+                "FragmentationPercent": "Fragmentation Percent",
+                "Criticality": "RDS_Criticality",
+                "Operation": "OPTIMIZE" or "ANALYZE" 
+              }
+              """
+              logger.info(f"Lambda triggered with event: {json.dumps(event)}")
+              
+              # Extract task-level input
+              host        = event["ClusterWriterEndpoint"]
+              schema      = event["Schema"]
+              table       = event["TableName"]
+              frag_pct = float(event.get("FragmentationPercent") or event.get("ReorganizePercent", 0))
+              criticality = event.get("Criticality", "Tier-3").upper()
+              operation   = event.get("Operation", "BOTH").upper()
+              
+              if operation not in ("OPTIMIZE", "ANALYZE", "BOTH"):
+                  logger.warning(f"Unexpected operation type: {operation}. No action will be taken.")     
+              
+              # Extract env variables
+              pEnvironment         = os.environ["pEnvironment"]
+              secret_name          = os.environ["SecretName"]
+              sns_critical_topic   = os.environ["CriticalSNSTopicArn"]
+              sns_noncritical_topic = os.environ["NonCriticalSNSTopicArn"]
+              port                 = int(os.environ.get("DBPort", "3306"))
+              
+              # Choose SNS topic based on criticality
+              sns_topic = sns_critical_topic if criticality == "TIER-1" else sns_noncritical_topic
+              
+              # Get DB credentials
+              try:
+                  secrets_client = boto3.client("secretsmanager")
+                  creds = json.loads(secrets_client.get_secret_value(SecretId=secret_name)["SecretString"])
+              except Exception as e:
+                  logger.error(f"Secrets retrieval failed: {str(e)}")
+                  notify_failure(sns_topic, f"SecretsManager error in {pEnvironment}: {str(e)}")
+                  raise
+              
+              log_payloads = []
+              conn = None              
+              try:
+                  conn = pymysql.connect(
+                      host=host,
+                      user=creds["username"],
+                      password=creds["password"],
+                      port=port,
+                      connect_timeout=120,
+                      autocommit=True,
+                      cursorclass=DictCursor
+                  )
+                  logger.info(f"Connected to DB host: {host}, schema: {schema}")
+                  with conn.cursor() as cursor:
+                      # Run OPTIMIZE TABLE
+                      if operation in ("OPTIMIZE", "BOTH"):
+                          try:
+                              start_opt = datetime.utcnow()
+                              optimize_stmt = f"OPTIMIZE TABLE `{schema}`.`{table}`;"
+                              logger.info(f"Executing: {optimize_stmt}")
+                              cursor.execute(optimize_stmt)
+                              optimize_result = cursor.fetchall()
+                              logger.info("OPTIMIZE result: %s", optimize_result)
+                              end_opt = datetime.utcnow()
+                              if optimize_result:
+                                  row = optimize_result[0]
+                                  log_payloads.append({
+                                      "ClusterWriterEndpoint": host,
+                                      "Schema": schema,
+                                      "TableName": table,
+                                      "FragmentationPercent": frag_pct,
+                                      "RDS_Criticality": criticality,
+                                      "Command_Type": "OPTIMIZE",
+                                      "Command": optimize_stmt,
+                                      "Status": row.get("Msg_type", "").upper(),
+                                      "Message": row.get("Msg_text", ""),
+                                      "StartTime": start_opt.isoformat(),
+                                      "EndTime": end_opt.isoformat()
+                                  })  
+                          except Exception as e:
+                              logger.error(f"OPTIMIZE error: {str(e)}")
+                              notify_failure(sns_topic, f"OPTIMIZE failed on {schema}.{table}: {str(e)}", pEnvironment)
+                              raise
+                      # Run ANALYZE TABLE
+                      if operation in ("ANALYZE", "BOTH"):
+                          try:
+                              start_analyze = datetime.utcnow()
+                              analyze_stmt = f"ANALYZE TABLE `{schema}`.`{table}`;"
+                              logger.info(f"Executing: {analyze_stmt}")
+                              cursor.execute(analyze_stmt)
+                              analyze_result = cursor.fetchall()
+                              logger.info("ANALYZE result: %s", analyze_result)
+                              end_analyze = datetime.utcnow()
+                              if analyze_result:
+                                  row = analyze_result[0]  # Only return first row of ANALYZE to Step Function
+                                  log_payloads.append({
+                                      "ClusterWriterEndpoint": host,
+                                      "Schema": schema,
+                                      "TableName": table,
+                                      "FragmentationPercent": frag_pct,
+                                      "RDS_Criticality": criticality,
+                                      "Command_Type": "ANALYZE",
+                                      "Command": analyze_stmt,
+                                      "Status": row.get("Msg_type", "").upper(),
+                                      "Message": row.get("Msg_text", ""),
+                                      "StartTime": start_analyze.isoformat(),
+                                      "EndTime": end_analyze.isoformat()
+                                  })                 
+                          except Exception as e:
+                              logger.error(f"ANALYZE error: {str(e)}")
+                              notify_failure(sns_topic, f"ANALYZE failed on {schema}.{table}: {str(e)}", pEnvironment)
+                              raise  
+              finally:
+                  if conn:
+                      conn.close()
+                      logger.info(f"Closed DB connection for {schema}.{table}")                      
+
+              # Return output to Step Function (for logging Lambda) 
+              logger.info(f"Lambda completed for {schema}.{table}, operations: {operation}, results: {json.dumps(log_payloads)}")
+              return log_payloads
+
+              
+          def notify_failure(topic_arn, message, pEnvironment):
+              sns = boto3.client("sns")
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Message=message,
+                  Subject=f"RDS Index Maintenance Worker Failure - {pEnvironment.upper()}"
+              )
+                  
+      Runtime: python3.9
+      VpcConfig:
+        SubnetIds: 
+          - !Ref SubnetID1
+          - !Ref SubnetID2
+        SecurityGroupIds:
+          - !Ref RDSIndexMaintenanceWorkerLambdaSecurityGroup
+      Layers:
+        - !Ref RDSIndexMaintenanceWorkerLambdaLayer
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 128
+      Environment:
+        Variables:
+          NonCriticalSNSTopicArn: !Ref RDSIndexMaintenanceSNSTopic
+          CriticalSNSTopicArn: !Ref RDSIndexMaintenanceCriticalSNSTopic
+          pEnvironment: !Ref pEnvironment
+          SecretName: !Sub "it-${pEnvironment}-secrets-mysql-rds-index-maintenance"
+          
+  RDSIndexMaintenanceLoggerLambdaLayer:
+       Type: AWS::Lambda::LayerVersion
+       Properties:
+         LayerName: !Sub "it-${pEnvironment}-rds-index-maintenance-lambda-logger-layer"
+         Description: Pg8000 lambda layer for rds-index-maintenance-logger
+         Content: 
+           S3Bucket: !Sub "it-${pEnvironment}-s3-rds-index-maintenance"
+           S3Key: pg8000-layer.zip
+         CompatibleRuntimes: 
+           - python3.11
+
+  RDSIndexMaintenanceLoggerLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: IsPrimary
+    Properties:
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt RDSIndexMaintenanceIAMRole.Arn
+      FunctionName: !Sub "it-${pEnvironment}-rds-index-maintenance-logger"
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          import pg8000
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Expected event input (from previous Lambda via Step Function):
+              {
+                  "ClusterWriterEndpoint": "...",
+                  "Schema": "...",
+                  "TableName": "...",
+                  "FragmentationPercent": 0,
+                  "RDS_Criticality": "TIER-1",
+                  "Operation": "Index Optimize, Analyze"
+                  "Command": "...",
+                  "Status": "STATUS",
+                  "Message": "OK",
+                  "StartTime": "2025-05-29T15:30:00.123Z",
+                  "EndTime": "2025-05-29T15:30:03.456Z"
+              },
+              {
+                  "ClusterWriterEndpoint": "...",
+                  "Schema": "...",
+                  "TableName": "...",
+                  "FragmentationPercent": 0,
+                  "RDS_Criticality": "TIER-1",
+                  "Operation": "Index Optimize, Analyze"
+                  "Command": "...",
+                  "Status": "STATUS",
+                  "Message": "OK",
+                  "StartTime": "2025-05-29T15:30:00.123Z",
+                  "EndTime": "2025-05-29T15:30:03.456Z"
+              }
+              """
+              
+              # Extract env variables
+              pEnvironment         = os.environ["pEnvironment"]
+              secret_name          = os.environ["SecretName"]
+              sns_critical_topic   = os.environ["CriticalSNSTopicArn"]
+              sns_noncritical_topic = os.environ["NonCriticalSNSTopicArn"]
+              
+              # Ensure event is a list
+              if isinstance(event, dict):
+                  event = [event]
+              if not isinstance(event, list):
+                  logger.error("Expected event to be a list of log entries.")
+                  raise ValueError("Input event must be a list of log entry dictionaries")
+                  
+              logger.info(f"Received {len(event)} log entries for processing.")
+                  
+              # Determine default SNS topic based on first log entry
+              first_log = event[0]
+              default_sns_topic = sns_critical_topic if first_log.get("RDS_Criticality", "TIER-3") == "TIER-1" else sns_noncritical_topic
+              
+              # Get DB credentials
+              try:
+                  secrets_client = boto3.client("secretsmanager")
+                  creds = json.loads(secrets_client.get_secret_value(SecretId=secret_name)["SecretString"])
+                  pg_host = creds["host"]
+                  pg_user = creds["username"]
+                  pg_pass = creds["password"]
+                  pg_db   = creds["dbname"]
+                  pg_port = int(creds["port"])
+                  logger.info(f"Retrieved Postgres connection info for {pg_user}@{pg_host}:{pg_port}/{pg_db}")
+              except Exception as e:
+                  logger.error(f"Secrets retrieval failed: {str(e)}")
+                  notify_failure(default_sns_topic, f"SecretsManager error in {pEnvironment}: {str(e)}", pEnvironment)
+                  raise
+              
+              # Insert the record using pg8000
+              try:
+                  conn = pg8000.connect(
+                      user=pg_user,
+                      password=pg_pass,
+                      host=pg_host,
+                      port=pg_port,
+                      database=pg_db
+                  )
+                  cursor = conn.cursor()
+                  logger.info("Connected to PostgreSQL database.")
+ 
+                  insert_stmt = """
+                      INSERT INTO rds_maintenance.index_maintenance_log (
+                          cluster_writer_endpoint, schema_name, table_name, fragmentation_percent,
+                          rds_criticality, operation, command, status, message,
+                          start_time, end_time, created_at
+                      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  """
+                  
+                  # Loop through each log entry
+                  for log in event:
+                      criticality = log.get("Criticality") or log.get("RDS_Criticality")
+                      fragmentation_percent = log.get("ReorganizePercent") or log.get("FragmentationPercent") or 0
+                      operation = log.get("Operation") or log.get("Command_Type") or "UNKNOWN"
+                      sns_topic = sns_critical_topic if (criticality or "TIER-3") == "TIER-1" else sns_noncritical_topic
+                      
+                      try:
+                          logger.info(f"Logging maintenance for table {log.get('Schema')}.{log.get('TableName')} [Op: {operation}]")
+                          cursor.execute(insert_stmt, (
+                              log.get("ClusterWriterEndpoint"),
+                              log.get("Schema"),
+                              log.get("TableName"),
+                              float(fragmentation_percent),
+                              criticality,
+                              operation,
+                              log.get("Command"),
+                              log.get("Status"),
+                              log.get("Message"),
+                              log.get("StartTime"),
+                              log.get("EndTime"),
+                              datetime.utcnow().isoformat() + "Z" 
+                          ))
+                          logger.info(f"Inserted log for {log.get('Schema')}.{log.get('TableName')} - Operation: {operation}")
+                      except Exception as e:
+                          logger.error(f"Failed to insert log into PostgreSQL: {str(e)} | Data: {json.dumps(log)}")
+                          notify_failure(sns_topic, f"PostgreSQL execution error in {pEnvironment}: {str(e)}", pEnvironment)
+                          raise
+                  
+                  logger.info("Committing all log entries to PostgreSQL.")
+                  conn.commit()
+                  cursor.close()
+                  conn.close()
+                  logger.info("All log entries successfully written to PostgreSQL.")
+                  
+              except Exception as e:
+                  logger.error(f"PostgreSQL connection or execution error: {str(e)}")
+                  notify_failure(default_sns_topic, f"Logger connection error in {pEnvironment}: {str(e)}", pEnvironment)
+                  raise                  
+                  
+          def notify_failure(topic_arn, message, pEnvironment):
+              sns_client = boto3.client("sns")
+              sns_client.publish(
+                  TopicArn=topic_arn,
+                  Subject=f"RDS Index Maintenance Logger Failure - {pEnvironment.upper()}",
+                  Message=message
+              )
+          
+      Runtime: python3.11
+      VpcConfig:
+        SubnetIds: 
+          - !Ref SubnetID1
+          - !Ref SubnetID2
+        SecurityGroupIds:
+          - !Ref RDSIndexMaintenanceLoggerLambdaSecurityGroup
+      Layers:
+        - !Ref RDSIndexMaintenanceLoggerLambdaLayer
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 128
+      Environment:
+        Variables:
+          NonCriticalSNSTopicArn: !Ref RDSIndexMaintenanceSNSTopic
+          CriticalSNSTopicArn: !Ref RDSIndexMaintenanceCriticalSNSTopic
+          pEnvironment: !Ref pEnvironment
+          SecretName: !Sub "it-${pEnvironment}-secrets-mysql-rds-index-maintenance-logging"
+          
+          
+Outputs:
+  RDSIndexMaintenanceLoggerLambdaLayer:
+    Description: "ARN of the RDS Index Maintenance Loggeer lambda layer"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-lambda-logger-layer"
+  RDSIndexMaintenanceLoggerLambdaFunctionArn:
+    Description: "ARN of the RDS Index Maintenance Logger Lambda function"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-logger"
+  RDSIndexMaintenanceMetadataReaderLambdaFunctionArn:
+    Description: "ARN of the RDS Index Maintenance Lambda function"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader"
+  RDSIndexMaintenancemetadataReaderLambdaLayer:
+    Description: "ARN of the RDS Index Maintenance metadata reader Lambda layer"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-metadata-reader-lambda-layer"
+  RDSIndexMaintenanceWorkerLambdaFunction:
+    Description: "ARN of the RDS Index Maintenance Worker Lambda function"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-worker"
+  RDSIndexMaintenanceWorkerLambdaLayer:
+    Description: "ARN of the RDS Index Maintenance worker Lambda layer"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance-worker-lambda-layer"
+  RDSIndexMaintenanceSNSTopicArn:
+    Description: ARN of the SNS topic
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceSNSTopic
+  RDSIndexMaintenanceCriticalSNSTopicArn:
+    Description: ARN of the critical RDS SNS topic
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceCriticalSNSTopic
+  RDSIndexMaintenanceIAMRole:
+    Description: "ARN of IAM role for RDS monitoring"
+    Condition: IsPrimary
+    Value: !Sub "it-${pEnvironment}-rds-index-maintenance"
+  RDSIndexMaintenanceMetadataReaderEventRuleArn:  
+    Description: "ARN of Event Bridge rule for RDS Index Maintenance Metadata Reader"
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceMetadataReaderEventRule
+  RDSIndexMaintenanceSecretArn:
+    Description: "ARN of AWS secret for RDS Index Maintenance"
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceSecret
+  RDSIndexMaintenanceLoggingSecretArn:
+    Description: "ARN of AWS secret for RDS Index Maintenance Logging"
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceLoggingSecret
+  RDSIndexMaintenanceMetadataReaderLambdaSecurityGroupArn:
+    Description: "ARN of RDS Index Maintenance Metadata Reader Security Group"
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceMetadataReaderLambdaSecurityGroup
+  RDSIndexMaintenanceStateMachineArn:
+    Description: "ARN of the Index Maintenance Step Functions state machine"
+    Condition: IsPrimary
+    Value: !Ref RDSIndexMaintenanceStateMachine
+      

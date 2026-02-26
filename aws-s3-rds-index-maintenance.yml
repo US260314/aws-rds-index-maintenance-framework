@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template: Create a Secure S3 Bucket for AWS RDS Database Index Maintenance'
+
+Parameters:
+  pEnvironment:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: Environment Type
+    Default: environment
+    
+Resources:
+  RDSIndexMaintenanceS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "it-${pEnvironment}-s3-rds-index-maintenance"
+      Tags:
+        - Key: environment
+          Value: !Ref pEnvironment
+        - Key: application
+          Value: app
+        - Key: team
+          Value: team
+        - Key: application-id
+          Value: tbd
+        - Key: cost-center
+          Value: tbd
+        - Key: sensitive-data
+          Value: none
+        - Key: s3-access
+          Value: private
+        - Key: dr-tier
+          Value: 2      
+        - Key: macie-enrolled
+          Value: exclude            
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: "Suspended"
+
+Outputs:
+  BucketName:
+    Description: "RDS Index Maintenance S3 bucket"
+    Value: !Ref RDSIndexMaintenanceS3Bucket
